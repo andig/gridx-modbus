@@ -54,7 +54,6 @@ func NewRTUClientHandler(address string) *RTUClientHandler {
 	handler.Address = address
 	handler.Timeout = serialTimeout
 	handler.IdleTimeout = serialIdleTimeout
-	handler.serialPort.Logger = handler // expose the logger
 	return handler
 }
 
@@ -74,11 +73,12 @@ func (mb *rtuPackager) SetSlave(slaveID byte) {
 	mb.SlaveID = slaveID
 }
 
-// Encode encodes PDU in a RTU frame:
-//  Slave Address   : 1 byte
-//  Function        : 1 byte
-//  Data            : 0 up to 252 bytes
-//  CRC             : 2 byte
+// Encode encodes PDU in an RTU frame:
+//
+//	Slave Address   : 1 byte
+//	Function        : 1 byte
+//	Data            : 0 up to 252 bytes
+//	CRC             : 2 byte
 func (mb *rtuPackager) Encode(pdu *ProtocolDataUnit) (adu []byte, err error) {
 	length := len(pdu.Data) + 4
 	if length > rtuMaxSize {
@@ -138,13 +138,6 @@ func (mb *rtuPackager) Decode(adu []byte) (pdu *ProtocolDataUnit, err error) {
 // rtuSerialTransporter implements Transporter interface.
 type rtuSerialTransporter struct {
 	serialPort
-	Logger logger
-}
-
-func (mb *rtuSerialTransporter) Printf(format string, v ...interface{}) {
-	if mb.Logger != nil {
-		mb.Logger.Printf(format, v...)
-	}
 }
 
 // InvalidLengthError is returned by readIncrementally when the modbus response would overflow buffer
@@ -160,12 +153,11 @@ func (e *InvalidLengthError) Error() string {
 
 // readIncrementally reads incrementally
 func readIncrementally(slaveID, functionCode byte, r io.Reader, deadline time.Time) ([]byte, error) {
-	n := 0
 	data := make([]byte, rtuMaxSize)
 
 	state := stateSlaveID
 	var length, toRead byte
-	crcCount := 0
+	var n, crcCount int
 
 	for {
 		if time.Now().After(deadline) { // Possible that serialport may spew data
@@ -174,7 +166,7 @@ func readIncrementally(slaveID, functionCode byte, r io.Reader, deadline time.Ti
 		if r == nil {
 			return nil, fmt.Errorf("reader is nil")
 		}
-		buf := make([]byte, 1, 1)
+		buf := make([]byte, 1)
 		_, err := io.ReadAtLeast(r, buf, 1)
 		if err != nil {
 			return nil, err
@@ -254,7 +246,6 @@ func readIncrementally(slaveID, functionCode byte, r io.Reader, deadline time.Ti
 			}
 		}
 	}
-
 }
 
 func (mb *rtuSerialTransporter) Send(aduRequest []byte) (aduResponse []byte, err error) {
@@ -262,25 +253,25 @@ func (mb *rtuSerialTransporter) Send(aduRequest []byte) (aduResponse []byte, err
 	defer mb.mu.Unlock()
 
 	// Make sure port is connected
-	if err = mb.serialPort.connect(); err != nil {
+	if err = mb.connect(); err != nil {
 		return
 	}
 	// Start the timer to close when idle
-	mb.serialPort.lastActivity = time.Now()
-	mb.serialPort.startCloseTimer()
+	mb.lastActivity = time.Now()
+	mb.startCloseTimer()
 
 	// Send the request
-	mb.serialPort.logf("modbus: send % x\n", aduRequest)
+	mb.logf("modbus: send % x\n", aduRequest)
 	if _, err = mb.port.Write(aduRequest); err != nil {
 		return
 	}
-	//function := aduRequest[1]
-	//functionFail := aduRequest[1] & 0x80
+	// function := aduRequest[1]
+	// functionFail := aduRequest[1] & 0x80
 	bytesToRead := calculateResponseLength(aduRequest)
 	time.Sleep(mb.calculateDelay(len(aduRequest) + bytesToRead))
 
-	data, err := readIncrementally(aduRequest[0], aduRequest[1], mb.port, time.Now().Add(mb.serialPort.Config.Timeout))
-	mb.serialPort.logf("modbus: recv % x\n", data[:])
+	data, err := readIncrementally(aduRequest[0], aduRequest[1], mb.port, time.Now().Add(mb.Config.Timeout))
+	mb.logf("modbus: recv % x\n", data[:])
 	aduResponse = data
 	return
 }

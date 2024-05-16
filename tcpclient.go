@@ -68,12 +68,13 @@ func (mb *tcpPackager) SetSlave(slaveID byte) {
 }
 
 // Encode adds modbus application protocol header:
-//  Transaction identifier: 2 bytes
-//  Protocol identifier: 2 bytes
-//  Length: 2 bytes
-//  Unit identifier: 1 byte
-//  Function code: 1 byte
-//  Data: n bytes
+//
+//	Transaction identifier: 2 bytes
+//	Protocol identifier: 2 bytes
+//	Length: 2 bytes
+//	Unit identifier: 1 byte
+//	Function code: 1 byte
+//	Data: n bytes
 func (mb *tcpPackager) Encode(pdu *ProtocolDataUnit) (adu []byte, err error) {
 	adu = make([]byte, tcpHeaderSize+1+len(pdu.Data))
 
@@ -100,10 +101,11 @@ func (mb *tcpPackager) Verify(aduRequest []byte, aduResponse []byte) error {
 }
 
 // Decode extracts PDU from TCP frame:
-//  Transaction identifier: 2 bytes
-//  Protocol identifier: 2 bytes
-//  Length: 2 bytes
-//  Unit identifier: 1 byte
+//
+//	Transaction identifier: 2 bytes
+//	Protocol identifier: 2 bytes
+//	Length: 2 bytes
+//	Unit identifier: 1 byte
 func (mb *tcpPackager) Decode(adu []byte) (pdu *ProtocolDataUnit, err error) {
 	// Read length value in the header
 	length := binary.BigEndian.Uint16(adu[4:])
@@ -131,15 +133,29 @@ type tcpTransporter struct {
 	LinkRecoveryTimeout time.Duration
 	// Recovery timeout if the protocol is malformed, e.g. wrong transaction ID
 	ProtocolRecoveryTimeout time.Duration
+	// Silent period after successful connection
+	ConnectDelay time.Duration
 	// Transmission logger
-	Logger logger
+	Logger Logger
 
 	// TCP connection
 	mu           sync.Mutex
 	conn         net.Conn
 	closeTimer   *time.Timer
 	lastActivity time.Time
+
+	lastAttemptedTransactionID  uint16
+	lastSuccessfulTransactionID uint16
 }
+
+// helper value to signify what to do in Send
+type readResult int
+
+const (
+	readResultDone readResult = iota
+	readResultRetry
+	readResultCloseRetry
+)
 
 // Send sends data to server and ensures response length is greater than header length.
 func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error) {
@@ -154,15 +170,6 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 		if err = mb.connect(); err != nil {
 			return
 		}
-
-		// If an answer to a previously timed-out request is already in teh buffer, this will result
-		// in a transaction ID mismatch from which we will never recover.  To prevent this, just
-		// flush any previous reponses before launching the next poll.  That's throwing away
-		// possibly useful data, but the previous request was already satisfied with a timeout
-		// error so that probably makes the most sense here.
-
-		// Be aware that this call resets the read deadline.
-		mb.flushAll()
 
 		// Set timer to close when idle
 		mb.lastActivity = time.Now()
@@ -180,7 +187,30 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 		if _, err = mb.conn.Write(aduRequest); err != nil {
 			return
 		}
-		// Read header first
+
+		mb.lastAttemptedTransactionID = binary.BigEndian.Uint16(aduRequest)
+		var res readResult
+		aduResponse, res, err = mb.readResponse(aduRequest, data[:], recoveryDeadline)
+		switch res {
+		case readResultDone:
+			if err == nil {
+				mb.lastSuccessfulTransactionID = binary.BigEndian.Uint16(aduResponse)
+			}
+			return
+		case readResultRetry:
+			continue
+		}
+
+		mb.logf("modbus: close connection and retry, because of %v", err)
+
+		mb.close()
+		time.Sleep(mb.LinkRecoveryTimeout)
+	}
+}
+
+func (mb *tcpTransporter) readResponse(aduRequest []byte, data []byte, recoveryDeadline time.Time) (aduResponse []byte, res readResult, err error) {
+	// res is readResultDone by default, which either means we succeeded or err contains the fatal error
+	for {
 		if _, err = io.ReadFull(mb.conn, data[:tcpHeaderSize]); err == nil {
 			aduResponse, err = mb.processResponse(data[:])
 			if err == nil {
@@ -190,24 +220,53 @@ func (mb *tcpTransporter) Send(aduRequest []byte) (aduResponse []byte, err error
 					return // everything is OK
 				}
 			}
-			if _, ok := err.(ErrTCPHeaderLength); !ok {
-				if mb.ProtocolRecoveryTimeout > 0 && recoveryDeadline.Sub(time.Now()) > 0 {
-					continue // TCP header OK but modbus frame not
+
+			// no time left, report error
+			if time.Since(recoveryDeadline) >= 0 {
+				return
+			}
+
+			switch v := err.(type) {
+			case ErrTCPHeaderLength:
+				if mb.LinkRecoveryTimeout > 0 {
+					// TCP header not OK - retry with another query
+					res = readResultRetry
+					return
+				}
+				// no time left, report error
+				return
+			case errTransactionIDMismatch:
+				// the first condition check for a normal transaction id mismatch. The second part of the condition check for a wrap-around. If a wraparound is
+				// detected (last attempt is smaller than last success), the id can be higher than the last success or lower than the last attempt, but not both
+				if (v.got > mb.lastSuccessfulTransactionID && v.got < mb.lastAttemptedTransactionID) ||
+					(mb.lastAttemptedTransactionID < mb.lastSuccessfulTransactionID && (v.got > mb.lastSuccessfulTransactionID || v.got < mb.lastAttemptedTransactionID)) {
+					// most likely, we simply had a timeout for the earlier query and now read the (late) response. Ignore it
+					// and assume that the response will come *without* sending another query. (If we send another query
+					// with transactionId X+1 here, we would again get a transactionMismatchError if the response to
+					// transactionId X is already in the buffer).
+					continue
+				}
+				if mb.ProtocolRecoveryTimeout > 0 {
+					// some other mismatch, still in time and protocol may recover - retry with another query
+					res = readResultRetry
+					return
+				}
+				return // no time left, report error
+			default:
+				if mb.ProtocolRecoveryTimeout > 0 {
+					// TCP header OK but modbus frame not - retry with another query
+					res = readResultRetry
+					return
 				}
 				return // no time left, report error
 			}
-			if mb.LinkRecoveryTimeout == 0 || recoveryDeadline.Sub(time.Now()) < 0 {
-				return // TCP header not OK, but no time left, report error
-			}
-			// Read attempt failed
 		} else if (err != io.EOF && err != io.ErrUnexpectedEOF) ||
-			mb.LinkRecoveryTimeout == 0 || recoveryDeadline.Sub(time.Now()) < 0 {
+			mb.LinkRecoveryTimeout == 0 || time.Until(recoveryDeadline) < 0 {
 			return
 		}
-		mb.logf("modbus: close connection and retry, because of %v", err)
-
-		mb.close()
-		time.Sleep(mb.LinkRecoveryTimeout)
+		// any other error, but recovery deadline isn't reached yet - close and retry
+		res = readResultCloseRetry
+		return
 	}
 }
 
@@ -233,12 +292,20 @@ func (mb *tcpTransporter) processResponse(data []byte) (aduResponse []byte, err 
 	return
 }
 
+type errTransactionIDMismatch struct {
+	got, expected uint16
+}
+
+func (e errTransactionIDMismatch) Error() string {
+	return fmt.Sprintf("modbus: response transaction id '%v' does not match request '%v'", e.got, e.expected)
+}
+
 func verify(aduRequest []byte, aduResponse []byte) (err error) {
 	// Transaction id
 	responseVal := binary.BigEndian.Uint16(aduResponse)
 	requestVal := binary.BigEndian.Uint16(aduRequest)
 	if responseVal != requestVal {
-		err = fmt.Errorf("modbus: response transaction id '%v' does not match request '%v'", responseVal, requestVal)
+		err = errTransactionIDMismatch{got: responseVal, expected: requestVal}
 		return
 	}
 	// Protocol id
@@ -273,6 +340,9 @@ func (mb *tcpTransporter) connect() error {
 			return err
 		}
 		mb.conn = conn
+
+		// silent period
+		time.Sleep(mb.ConnectDelay)
 	}
 	return nil
 }
@@ -335,33 +405,9 @@ func (mb *tcpTransporter) closeIdle() {
 	if mb.IdleTimeout <= 0 {
 		return
 	}
-	idle := time.Now().Sub(mb.lastActivity)
-	if idle >= mb.IdleTimeout {
+
+	if idle := time.Since(mb.lastActivity); idle >= mb.IdleTimeout {
 		mb.logf("modbus: closing connection due to idle timeout: %v", idle)
 		mb.close()
-	}
-}
-
-// flushAll implements a non-blocking read flush.  Be warned it resets
-// the read deadline.
-func (mb *tcpTransporter) flushAll() (int, error) {
-	if err := mb.conn.SetReadDeadline(time.Now()); err != nil {
-		return 0, err
-	}
-
-	count := 0
-	buffer := make([]byte, 1024)
-
-	for {
-		n, err := mb.conn.Read(buffer)
-
-		if err != nil {
-			return count + n, err
-		} else if n > 0 {
-			count = count + n
-		} else {
-			// didn't flush any new bytes, return
-			return count, err
-		}
 	}
 }

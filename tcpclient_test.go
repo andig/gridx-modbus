@@ -40,7 +40,7 @@ func TestTCPDecoding(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if 3 != pdu.FunctionCode {
+	if pdu.FunctionCode != 3 {
 		t.Fatalf("Function code: expected %v, actual %v", 3, pdu.FunctionCode)
 	}
 	expected := []byte{0, 120, 0, 3}
@@ -83,6 +83,8 @@ func TestTCPTransporter(t *testing.T) {
 		t.Fatalf("unexpected response: %x", rsp)
 	}
 	time.Sleep(150 * time.Millisecond)
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	if client.conn != nil {
 		t.Fatalf("connection is not closed: %+v", client.conn)
 	}
@@ -91,6 +93,85 @@ func TestTCPTransporter(t *testing.T) {
 func TestErrTCPHeaderLength_Error(t *testing.T) {
 	// should not explode
 	_ = ErrTCPHeaderLength(1000).Error()
+}
+
+func TestTCPTransactionMismatchRetry(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	done := make(chan struct{})
+	defer close(done)
+	data := []byte{0xCA, 0xFE}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer conn.Close()
+		// ensure that answer is only written after second read attempt failed
+		time.Sleep(2500 * time.Millisecond)
+		packager := &tcpPackager{SlaveID: 0}
+		pdu := &ProtocolDataUnit{
+			FunctionCode: FuncCodeReadInputRegisters,
+			Data:         append([]byte{0x02}, data...),
+		}
+		data1, err := packager.Encode(pdu)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		// encoding same PDU twice will increment the transaction id
+		data2, err := packager.Encode(pdu)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		// encoding same PDU twice will increment the transaction id
+		data3, err := packager.Encode(pdu)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := conn.Write(data1); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := conn.Write(data2); err != nil {
+			t.Error(err)
+			return
+		}
+		if _, err := conn.Write(data3); err != nil {
+			t.Error(err)
+			return
+		}
+		// keep the connection open until the main routine is finished
+		<-done
+	}()
+	handler := NewTCPClientHandler(ln.Addr().String())
+	handler.Timeout = 1 * time.Second
+	handler.ProtocolRecoveryTimeout = 50 * time.Millisecond
+	client := NewClient(handler)
+	_, err = client.ReadInputRegisters(0, 1)
+	opError, ok := err.(*net.OpError)
+	if !ok || !opError.Timeout() {
+		t.Fatalf("expected timeout error, got %q", err)
+	}
+	_, err = client.ReadInputRegisters(0, 1)
+	opError, ok = err.(*net.OpError)
+	if !ok || !opError.Timeout() {
+		t.Fatalf("expected timeout error, got %q", err)
+	}
+	resp, err := client.ReadInputRegisters(0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(resp, data) {
+		t.Fatalf("got wrong response: got %q wanted %q", resp, data)
+	}
 }
 
 func BenchmarkTCPEncoder(b *testing.B) {
